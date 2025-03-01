@@ -11,6 +11,13 @@ TASK_CONFIGS = {
         'episode_len': 1000,  # 1000,
         'camera_names': ['left', 'right', 'wrist'] # corresponding to image keys saved in h5py files
     },
+    'sim_transfer_cube': {
+        'dataset_dir': [
+            "data/aloha_sim_dataset",  # 指向解压后的数据集路径
+        ],
+        'episode_len': 1000,
+        'camera_names': ['left', 'right', 'wrist']
+    },
 }
 ####################################################################################
 

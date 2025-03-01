@@ -15,6 +15,161 @@ from .configuration_llava_pythia import LlavaPythiaConfig
 
 logger = logging.get_logger(__name__)
 
+# 添加VLA-Cache机制实现
+class VLACache:
+    """
+    VLA-Cache: 自适应Token缓存机制，用于减少视觉语言模型中的冗余计算
+    
+    此类实现了一个自适应缓存策略，通过保存和重用重要的Token特征，
+    减少Transformer模型在推理过程中的计算量。
+    """
+    
+    def __init__(self, cache_size=0.3, importance_threshold=0.7, 
+                 cache_update_freq=10, cache_warmup_steps=5):
+        """
+        初始化VLA-Cache
+        
+        Args:
+            cache_size (float): 缓存大小占总Token数的比例 (0.0-1.0)
+            importance_threshold (float): Token重要性阈值 (0.0-1.0)
+            cache_update_freq (int): 缓存更新频率（每N步更新一次）
+            cache_warmup_steps (int): 预热步数，在此步数前不使用缓存
+        """
+        self.cache_size = cache_size
+        self.importance_threshold = importance_threshold
+        self.cache_update_freq = cache_update_freq
+        self.cache_warmup_steps = cache_warmup_steps
+        
+        # 缓存存储
+        self.token_cache = {}  # 缓存的Token表示
+        self.importance_scores = {}  # Token重要性分数
+        self.cache_hits = 0  # 缓存命中次数
+        self.total_queries = 0  # 总查询次数
+        self.step_counter = 0  # 当前步数
+        
+    def reset_stats(self):
+        """重置缓存统计信息"""
+        self.cache_hits = 0
+        self.total_queries = 0
+        
+    def compute_token_importance(self, hidden_states, attention_mask=None):
+        """
+        计算每个Token的重要性分数
+        
+        使用注意力权重和隐藏状态范数的组合来评估Token的重要性
+        
+        Args:
+            hidden_states (torch.Tensor): Token的隐藏状态 [batch, seq_len, hidden_dim]
+            attention_mask (torch.Tensor): 注意力掩码 [batch, seq_len]
+            
+        Returns:
+            torch.Tensor: Token重要性分数 [batch, seq_len]
+        """
+        # 使用隐藏状态的L2范数作为简单的重要性度量
+        importance = torch.norm(hidden_states, dim=-1)
+        
+        # 将重要性分数归一化到[0,1]区间
+        importance = (importance - importance.min(dim=1, keepdim=True)[0]) / \
+                    (importance.max(dim=1, keepdim=True)[0] - importance.min(dim=1, keepdim=True)[0] + 1e-6)
+        
+        # 如果提供了注意力掩码，则将填充Token的重要性设为0
+        if attention_mask is not None:
+            importance = importance * attention_mask.float()
+            
+        return importance
+    
+    def update_cache(self, token_ids, hidden_states, attention_mask=None):
+        """
+        更新Token缓存
+        
+        根据Token的重要性分数，选择重要的Token加入缓存
+        
+        Args:
+            token_ids (torch.Tensor): Token的ID [batch, seq_len]
+            hidden_states (torch.Tensor): Token的隐藏状态 [batch, seq_len, hidden_dim]
+            attention_mask (torch.Tensor): 注意力掩码 [batch, seq_len]
+        """
+        self.step_counter += 1
+        
+        # 预热阶段不更新缓存
+        if self.step_counter <= self.cache_warmup_steps:
+            return
+        
+        # 根据更新频率决定是否更新缓存
+        if self.step_counter % self.cache_update_freq != 0:
+            return
+            
+        # 计算Token重要性
+        importance = self.compute_token_importance(hidden_states, attention_mask)
+        
+        # 为每个批次单独更新缓存
+        for b in range(token_ids.size(0)):
+            for s in range(token_ids.size(1)):
+                # 只缓存重要性超过阈值的Token
+                if importance[b, s] >= self.importance_threshold:
+                    token_id = token_ids[b, s].item()
+                    # 更新缓存中的表示
+                    if token_id in self.token_cache:
+                        # 使用指数移动平均更新缓存表示
+                        self.token_cache[token_id] = 0.9 * self.token_cache[token_id] + \
+                                                    0.1 * hidden_states[b, s].detach()
+                        self.importance_scores[token_id] = max(self.importance_scores[token_id], 
+                                                            importance[b, s].item())
+                    else:
+                        self.token_cache[token_id] = hidden_states[b, s].detach()
+                        self.importance_scores[token_id] = importance[b, s].item()
+        
+        # 如果缓存超过指定大小，移除最不重要的Token
+        if len(self.token_cache) > self.cache_size * 1000:  # 假设最大缓存1000个Token
+            # 按重要性排序
+            sorted_tokens = sorted(self.importance_scores.items(), key=lambda x: x[1])
+            # 移除最不重要的Token直到缓存大小合适
+            tokens_to_remove = sorted_tokens[:int(len(sorted_tokens) - self.cache_size * 1000)]
+            for token_id, _ in tokens_to_remove:
+                del self.token_cache[token_id]
+                del self.importance_scores[token_id]
+    
+    def apply_cache(self, input_ids, input_embeds):
+        """
+        应用缓存到输入嵌入
+        
+        用缓存中的表示替换输入中匹配的Token嵌入
+        
+        Args:
+            input_ids (torch.Tensor): 输入Token ID [batch, seq_len]
+            input_embeds (torch.Tensor): 输入Token嵌入 [batch, seq_len, hidden_dim]
+            
+        Returns:
+            torch.Tensor: 应用缓存后的Token嵌入
+        """
+        # 预热阶段不使用缓存
+        if self.step_counter <= self.cache_warmup_steps or not self.token_cache:
+            return input_embeds
+            
+        # 复制输入嵌入以避免修改原始张量
+        cached_embeds = input_embeds.clone()
+        
+        # 应用缓存
+        for b in range(input_ids.size(0)):
+            for s in range(input_ids.size(1)):
+                token_id = input_ids[b, s].item()
+                if token_id in self.token_cache:
+                    cached_embeds[b, s] = self.token_cache[token_id].to(input_embeds.device)
+                    self.cache_hits += 1
+                self.total_queries += 1
+                    
+        return cached_embeds
+    
+    def get_cache_stats(self):
+        """获取缓存统计信息"""
+        hit_ratio = self.cache_hits / (self.total_queries + 1e-8)
+        return {
+            "cache_size": len(self.token_cache),
+            "cache_hits": self.cache_hits,
+            "total_queries": self.total_queries,
+            "hit_ratio": hit_ratio,
+        }
+
 class LLavaPythiaModel(LlavaMetaModel, GPTNeoXModel):
     config_class = LlavaPythiaConfig
 
@@ -39,6 +194,17 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
         self.head_type = config.action_head_type
         self.visual_concat = config.concat
         self.action_dim = config.action_dim
+        
+        # 初始化VLA-Cache
+        self.use_cache_mechanism = getattr(config, 'use_cache_mechanism', False)
+        if self.use_cache_mechanism:
+            self.token_cache = VLACache(
+                cache_size=getattr(config, 'cache_size', 0.3),
+                importance_threshold=getattr(config, 'importance_threshold', 0.7),
+                cache_update_freq=getattr(config, 'cache_update_freq', 10),
+                cache_warmup_steps=getattr(config, 'cache_warmup_steps', 5)
+            )
+        
         if config.action_head_type == 'act':
             self.embed_out = build_ACT_head(config.act['act'])
             middle_dim = int(max(config.hidden_size, config.act['act']['hidden_dim']) / 2)
@@ -179,6 +345,11 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
         input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images, images_r=images_r, images_top=images_top, visual_concat=self.visual_concat, states=states)
 
+        # 应用Token缓存（如果启用）
+        if self.use_cache_mechanism and input_ids is not None and inputs_embeds is not None and eval:
+            # 在评估模式下才应用缓存，以免影响训练
+            inputs_embeds = self.token_cache.apply_cache(input_ids, inputs_embeds)
+
         outputs = self.get_model()(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -191,6 +362,11 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
         )
 
         hidden_states = outputs[0]
+        
+        # 更新Token缓存（如果启用）
+        if self.use_cache_mechanism and input_ids is not None and eval:
+            # 只在评估模式下更新缓存
+            self.token_cache.update_cache(input_ids, hidden_states, attention_mask)
 
         if self.head_type == 'fc':
             loss, logits = self.forward_fc_head(labels, actions, hidden_states, states)

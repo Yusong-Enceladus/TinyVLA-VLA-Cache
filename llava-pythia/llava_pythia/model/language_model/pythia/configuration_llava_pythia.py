@@ -174,9 +174,55 @@ DEFAULT_VISUAL_CONFIG = {
 # print(DEFAULT_ACT_CONFIG['act'])
 
 class LlavaPythiaConfig(GPTNeoXConfig):
+    """
+    Configuration class for LlavaPythia.
+    Extends GPTNeoXConfig and includes additional parameters for the vision tower and multimodal projector.
+    """
+
     model_type = "llava_pythia"
 
-    def __init__(self, vision_config=None, **kwargs):
+    def __init__(
+            self,
+            vocab_size=50432,
+            hidden_size=2048,
+            max_position_embeddings=2048,
+            num_hidden_layers=24,
+            num_attention_heads=16,
+            intermediate_size=None,
+            hidden_act="gelu",
+            rotary_pct=1.0,
+            rotary_emb_base=10000,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            classifier_dropout=None,
+            initializer_range=0.02,
+            layer_norm_eps=1e-5,
+            bias=False,
+            use_cache=True,
+            bos_token_id=0,
+            eos_token_id=1,
+            tie_word_embeddings=False,
+            use_parallel_residual=True,
+            vision_config=None,
+            vision_tower=None,
+            mm_projector=None,
+            mm_vision_select_layer=-2,  # default to the penultimate layer
+            mm_vision_select_feature="patch",  # default to the patch features
+            mm_use_im_start_end=False,
+            mm_use_im_patch_token=False,
+            mm_projector_type="mlp2x_gelu",
+            action_head_type="fc",
+            action_dim=10,
+            state_dim=8,
+            chunk_size=16,
+            # VLA-Cache相关配置
+            use_cache_mechanism=False,  # 是否启用VLA-Cache机制
+            cache_size=0.3,  # 缓存大小占总Token数的比例
+            importance_threshold=0.7,  # Token重要性阈值
+            cache_update_freq=10,  # 缓存更新频率
+            cache_warmup_steps=5,  # 缓存预热步数
+            **kwargs
+    ):
         if vision_config is None:
             self.vision_config = DEFAULT_VISUAL_CONFIG
         else:
